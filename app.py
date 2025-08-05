@@ -7,8 +7,19 @@ from PIL import Image
 import io
 import base64
 from torchvision import transforms
-from pytorch_grad_cam import EigenCAM
-from pytorch_grad_cam.utils.image import show_cam_on_image
+# Try to import grad-cam, fallback if not available
+try:
+    from pytorch_grad_cam import EigenCAM
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    GRADCAM_AVAILABLE = True
+except ImportError:
+    try:
+        from grad_cam import EigenCAM
+        from grad_cam.utils.image import show_cam_on_image
+        GRADCAM_AVAILABLE = True
+    except ImportError:
+        GRADCAM_AVAILABLE = False
+        st.warning("⚠️ GradCAM library not available. Heatmap visualization will be disabled.")
 import torch.nn.functional as F
 import requests
 import os
@@ -222,6 +233,10 @@ def predict_image(model, image, device):
 
 def generate_cam_visualization(model, image, device):
     """Generate EigenCAM visualization"""
+    if not GRADCAM_AVAILABLE:
+        st.warning("GradCAM visualization is not available due to missing dependencies.")
+        return None, None
+        
     try:
         # Prepare target layers (last transformer block)
         target_layers = [model.layers[-1].blocks[-1].norm1]
@@ -386,8 +401,9 @@ def main():
                     )
                     st.progress(prob / 100)
         
-        # CAM Visualization (only show if analysis has been done)
-        if hasattr(st.session_state, 'analysis_done') and st.session_state.analysis_done and st.session_state.cam_image is not None:
+        # CAM Visualization (only show if analysis has been done and gradcam is available)
+        if (hasattr(st.session_state, 'analysis_done') and st.session_state.analysis_done and 
+            GRADCAM_AVAILABLE and st.session_state.cam_image is not None):
             st.header("🔥 AI Attention Heatmap (EigenCAM)")
             st.info("The heatmap shows which areas of the X-ray the AI model focused on when making its prediction.")
             
