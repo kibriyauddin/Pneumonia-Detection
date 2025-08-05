@@ -31,46 +31,44 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ✅ Function to download from Google Drive
 def download_file_from_google_drive_gdown(file_id, destination):
-    """Download file from Google Drive using gdown (with confirmation bypass)."""
+    """Download file from Google Drive using gdown."""
     try:
         url = f"https://drive.google.com/uc?id={file_id}"
         gdown.download(url, str(destination), quiet=False, fuzzy=True)
         return destination.exists() and destination.stat().st_size > 1000000
     except Exception as e:
-        st.error(f"Error with gdown: {str(e)}")
+        st.error(f"Error downloading file: {str(e)}")
         return False
 
 
-# ✅ Download model if not available
 def download_models():
     models_config = {
+        "swin_transformer_full_model.pth": {
+            "file_id": "18XWnhMvIaKDMGDXwsGx-sEW9XFB_PnsP",  # replace with actual file ID from your screenshot
+            "size_mb": "~333MB"
+        },
         "swin_transformer_weights.pth": {
-            "file_id": "1Tzlr3zIf1iNzBCLHlkYVel7EKtq_tUZF",
-            "size_mb": "~400MB",
-            "direct_url": "https://drive.google.com/file/d/1Tzlr3zIf1iNzBCLHlkYVel7EKtq_tUZF/view?usp=sharing"
+            "file_id": "1a58nbPlsbbqonfqnBYCvt8vh77Rc2SGa",  # replace with actual file ID from your screenshot
+            "size_mb": "~331MB"
         }
     }
 
     models_dir = Path("models")
     models_dir.mkdir(exist_ok=True)
-
     download_status = {}
 
     for model_name, config in models_config.items():
         model_path = models_dir / model_name
-
         if not model_path.exists():
             st.warning(f"📥 Downloading {model_name} ({config['size_mb']})...")
             success = download_file_from_google_drive_gdown(config["file_id"], model_path)
-
             if success:
                 st.success(f"✅ {model_name} downloaded successfully!")
-                download_status[model_name] = "✅ Downloaded successfully"
+                download_status[model_name] = "✅ Downloaded"
             else:
-                st.error(f"❌ Failed to download {model_name}. Please check the Google Drive link.")
-                download_status[model_name] = "❌ Download failed"
+                st.error(f"❌ Failed to download {model_name}")
+                download_status[model_name] = "❌ Failed"
         else:
             download_status[model_name] = "✅ Already exists"
 
@@ -87,7 +85,7 @@ def load_model():
         download_models()
 
     if not weights_path.exists() or weights_path.stat().st_size < 1000000:
-        st.error("❌ Model file is missing or corrupted. Please retry download.")
+        st.error("❌ Model file is missing or corrupted.")
         return None, None
 
     model = timm.create_model("swin_base_patch4_window7_224", pretrained=False, num_classes=2)
@@ -95,7 +93,6 @@ def load_model():
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-
     return model, device
 
 
@@ -113,40 +110,27 @@ def preprocess_image(image):
 def predict_image(model, image, device):
     class_names = ['NORMAL', 'PNEUMONIA']
     input_tensor = preprocess_image(image).to(device)
-
     with torch.no_grad():
         output = model(input_tensor)
         probabilities = F.softmax(output, dim=1)
         confidence, predicted = torch.max(probabilities, 1)
-
     return class_names[predicted.item()], confidence.item() * 100, {
         class_names[i]: probabilities[0][i].item() * 100 for i in range(len(class_names))
     }
 
 
-# ✅ Main App
 def main():
     st.markdown('<h1 class="main-header">🫁 Chest X-Ray Pneumonia Detection System</h1>', unsafe_allow_html=True)
     st.markdown('<h2 class="sub-header">AI-Powered Medical Image Analysis</h2>', unsafe_allow_html=True)
 
-    # Sidebar Information
     with st.sidebar:
         st.header("📋 Project Information")
         st.info("""
-        **BTech Final Year Project**
-
-        🎯 Objective: Pneumonia detection in chest X-rays using Swin Transformer
-        🤖 Model: Swin Transformer (Base)
-        📊 Accuracy: 94%
-        🏥 Classes: Normal vs Pneumonia
+        🎯 Pneumonia detection using Swin Transformer
+        🤖 Model Accuracy: 94%
+        ⚠️ Educational use only
         """)
 
-        st.warning("""
-        ⚠️ This is an educational project. 
-        Not for actual medical diagnosis.
-        """)
-
-    # Download Model
     st.header("📦 Model Setup")
     download_status = download_models()
 
@@ -155,25 +139,21 @@ def main():
 
     st.success("✅ Model is ready!")
 
-    # Load Model
     model, device = load_model()
     if model is None:
         st.stop()
 
-    st.success(f"✅ Model loaded successfully! Running on: {device}")
+    st.success(f"✅ Model loaded successfully on {device}")
 
-    # File upload
     st.header("📤 Upload Chest X-Ray Image")
     uploaded_file = st.file_uploader("Choose an image...", type=['png', 'jpg', 'jpeg'])
 
     if uploaded_file is not None:
         image = Image.open(uploaded_file)
         st.image(image, caption="Uploaded Image", use_column_width=True)
-
         if st.button("🔍 Analyze Image"):
             with st.spinner("Analyzing..."):
                 predicted_class, confidence, class_probs = predict_image(model, image, device)
-
                 if predicted_class == "NORMAL":
                     st.markdown(f'<div class="prediction-box normal-prediction">✅ Prediction: {predicted_class}</div>', unsafe_allow_html=True)
                 else:
