@@ -5,21 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 import io
-import base64
 from torchvision import transforms
-# Try to import grad-cam, fallback if not available
-try:
-    from pytorch_grad_cam import EigenCAM
-    from pytorch_grad_cam.utils.image import show_cam_on_image
-    GRADCAM_AVAILABLE = True
-except ImportError:
-    try:
-        from grad_cam import EigenCAM
-        from grad_cam.utils.image import show_cam_on_image
-        GRADCAM_AVAILABLE = True
-    except ImportError:
-        GRADCAM_AVAILABLE = False
-        st.warning("⚠️ GradCAM library not available. Heatmap visualization will be disabled.")
 import torch.nn.functional as F
 import requests
 import os
@@ -79,12 +65,6 @@ st.markdown("""
         background-color: #f8f9fa;
         border-radius: 10px;
     }
-    .download-status {
-        padding: 0.5rem;
-        border-radius: 5px;
-        margin: 0.5rem 0;
-        text-align: center;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -103,12 +83,14 @@ def download_file_from_google_drive(file_id, destination):
             break
     
     # Save the file
+    total_size = 0
     with open(destination, "wb") as f:
         for chunk in response.iter_content(chunk_size=32768):
             if chunk:
                 f.write(chunk)
+                total_size += len(chunk)
     
-    return True
+    return total_size
 
 def download_models():
     """Download model files from Google Drive if they don't exist"""
@@ -116,11 +98,7 @@ def download_models():
     # Model file configurations
     models_config = {
         "swin_transformer_weights.pth": {
-            "file_id": "1Tzlr3zIf1iNzBCLHlkYVel7EKtq_tUZF",  # Extract from your first URL
-            "size_mb": "~400MB"
-        },
-        "swin_transformer_full_model.pth": {
-            "file_id": "1RsZxwzmIOO5ErpZwOfyrZXpBafUBgmY2",  # Extract from your second URL
+            "file_id": "1Tzlr3zIf1iNzBCLHlkYVel7EKtq_tUZF",
             "size_mb": "~400MB"
         }
     }
@@ -145,10 +123,10 @@ def download_models():
                 status_text.text("Downloading model file...")
                 progress_bar.progress(50)
                 
-                download_file_from_google_drive(config["file_id"], model_path)
+                file_size = download_file_from_google_drive(config["file_id"], model_path)
                 
                 progress_bar.progress(100)
-                status_text.text("✅ Download completed!")
+                status_text.text(f"✅ Download completed! ({file_size / (1024*1024):.1f} MB)")
                 
                 download_status[model_name] = "✅ Downloaded successfully"
                 
@@ -167,23 +145,23 @@ def load_model():
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Try to load the weights file first (smaller file)
+        # Try to load the weights file
         weights_path = Path("models/swin_transformer_weights.pth")
-        full_model_path = Path("models/swin_transformer_full_model.pth")
         
+        if not weights_path.exists():
+            st.error("❌ Model weights file not found. Please download it first.")
+            return None, None
+        
+        # Create model architecture
         model = timm.create_model("swin_base_patch4_window7_224", pretrained=False, num_classes=2)
         
-        if weights_path.exists():
-            # Load state dict
+        # Load state dict
+        try:
             state_dict = torch.load(weights_path, map_location=device)
             model.load_state_dict(state_dict)
             st.success("✅ Loaded model from weights file")
-        elif full_model_path.exists():
-            # Load full model
-            model = torch.load(full_model_path, map_location=device)
-            st.success("✅ Loaded full model file")
-        else:
-            st.error("❌ No model files found. Please download them first.")
+        except Exception as e:
+            st.error(f"❌ Error loading model weights: {str(e)}")
             return None, None
         
         model.to(device)
@@ -231,30 +209,55 @@ def predict_image(model, image, device):
     
     return predicted_class, confidence_score, class_probabilities
 
-def generate_cam_visualization(model, image, device):
-    """Generate EigenCAM visualization"""
-    if not GRADCAM_AVAILABLE:
-        st.warning("GradCAM visualization is not available due to missing dependencies.")
-        return None, None
-        
+def generate_simple_attention_map(model, image, device):
+    """Generate a simple attention visualization using model features"""
     try:
-        # Prepare target layers (last transformer block)
-        target_layers = [model.layers[-1].blocks[-1].norm1]
-        cam = EigenCAM(model=model, target_layers=target_layers)
-        
         input_tensor = preprocess_image(image).to(device)
         
-        # Generate CAM
-        grayscale_cam = cam(input_tensor=input_tensor)[0, :]
+        # Hook to capture feature maps
+        feature_maps = []
+        def hook_fn(module, input, output):
+            feature_maps.append(output)
         
-        # Convert PIL to numpy for visualization
-        rgb_img = np.array(image.resize((224, 224))).astype(np.float32) / 255.0
-        cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
+        # Register hook on the last layer
+        hook = model.layers[-1].register_forward_hook(hook_fn)
         
-        return cam_image, rgb_img
+        # Forward pass
+        with torch.no_grad():
+            _ = model(input_tensor)
+        
+        # Remove hook
+        hook.remove()
+        
+        if feature_maps:
+            # Get the last feature map and average across channels
+            feature_map = feature_maps[-1].squeeze(0)  # Remove batch dimension
+            
+            # Average across the feature dimension to get spatial attention
+            if len(feature_map.shape) == 3:  # [H, W, features] or [features, H, W]
+                if feature_map.shape[0] > feature_map.shape[1]:  # [features, H, W]
+                    attention_map = torch.mean(feature_map, dim=0)
+                else:  # [H, W, features]
+                    attention_map = torch.mean(feature_map, dim=-1)
+            else:
+                attention_map = feature_map
+            
+            # Normalize and resize
+            attention_map = (attention_map - attention_map.min()) / (attention_map.max() - attention_map.min())
+            attention_map = F.interpolate(
+                attention_map.unsqueeze(0).unsqueeze(0), 
+                size=(224, 224), 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze()
+            
+            return attention_map.cpu().numpy()
+        
+        return None
+        
     except Exception as e:
-        st.error(f"Error generating CAM visualization: {str(e)}")
-        return None, None
+        st.error(f"Error generating attention map: {str(e)}")
+        return None
 
 def main():
     # Header
@@ -281,11 +284,11 @@ def main():
         
         st.header("📖 How to Use")
         st.markdown("""
-        1. Download models (if needed)
+        1. Download model (if needed)
         2. Upload a chest X-ray image
         3. Click 'Analyze Image'
         4. View prediction results
-        5. Examine AI attention map
+        5. Examine simple attention map
         """)
         
         st.header("⚠️ Medical Disclaimer")
@@ -299,13 +302,12 @@ def main():
     
     # Check if models exist
     weights_path = Path("models/swin_transformer_weights.pth")
-    full_model_path = Path("models/swin_transformer_full_model.pth")
     
-    if not weights_path.exists() and not full_model_path.exists():
-        st.warning("⚠️ Model files not found. Please download them first.")
+    if not weights_path.exists():
+        st.warning("⚠️ Model file not found. Please download it first.")
         
-        if st.button("📥 Download Models from Google Drive", type="primary"):
-            with st.spinner("Downloading models... This may take a few minutes..."):
+        if st.button("📥 Download Model from Google Drive", type="primary"):
+            with st.spinner("Downloading model... This may take a few minutes..."):
                 download_status = download_models()
                 
                 # Display download status
@@ -316,26 +318,19 @@ def main():
                     else:
                         st.error(f"{model_name}: {status}")
                 
-                st.rerun()  # Refresh the app after download
+                if any("✅" in status for status in download_status.values()):
+                    st.success("🔄 Reloading app with downloaded model...")
+                    st.rerun()
     else:
-        st.success("✅ Model files are available!")
-        
-        # Display model info
-        col1, col2 = st.columns(2)
-        with col1:
-            if weights_path.exists():
-                size_mb = weights_path.stat().st_size / (1024 * 1024)
-                st.info(f"📁 **Weights file**: {size_mb:.1f} MB")
-        with col2:
-            if full_model_path.exists():
-                size_mb = full_model_path.stat().st_size / (1024 * 1024)
-                st.info(f"📁 **Full model**: {size_mb:.1f} MB")
+        st.success("✅ Model file is available!")
+        size_mb = weights_path.stat().st_size / (1024 * 1024)
+        st.info(f"📁 **Model file**: {size_mb:.1f} MB")
     
     # Load model
     model, device = load_model()
     
     if model is None:
-        st.error("❌ Failed to load model. Please ensure model files are downloaded correctly.")
+        st.error("❌ Failed to load model. Please ensure model file is downloaded correctly.")
         st.stop()
     
     st.success(f"✅ Model loaded successfully! Running on: {device}")
@@ -367,15 +362,14 @@ def main():
                     # Make prediction
                     predicted_class, confidence_score, class_probabilities = predict_image(model, image, device)
                     
-                    # Generate CAM visualization
-                    cam_image, original_resized = generate_cam_visualization(model, image, device)
+                    # Generate simple attention map
+                    attention_map = generate_simple_attention_map(model, image, device)
                     
                     # Store results in session state
                     st.session_state.predicted_class = predicted_class
                     st.session_state.confidence_score = confidence_score
                     st.session_state.class_probabilities = class_probabilities
-                    st.session_state.cam_image = cam_image
-                    st.session_state.original_resized = original_resized
+                    st.session_state.attention_map = attention_map
                     st.session_state.analysis_done = True
             
             # Display results if analysis has been done
@@ -401,29 +395,36 @@ def main():
                     )
                     st.progress(prob / 100)
         
-        # CAM Visualization (only show if analysis has been done and gradcam is available)
+        # Attention Visualization
         if (hasattr(st.session_state, 'analysis_done') and st.session_state.analysis_done and 
-            GRADCAM_AVAILABLE and st.session_state.cam_image is not None):
-            st.header("🔥 AI Attention Heatmap (EigenCAM)")
-            st.info("The heatmap shows which areas of the X-ray the AI model focused on when making its prediction.")
+            st.session_state.attention_map is not None):
+            
+            st.header("🔥 AI Attention Map")
+            st.info("This shows areas the AI model focused on when making its prediction.")
             
             col3, col4 = st.columns([1, 1])
             
             with col3:
-                st.subheader("Original (Resized)")
+                st.subheader("Original Image")
                 fig, ax = plt.subplots(figsize=(6, 6))
-                ax.imshow(st.session_state.original_resized)
+                ax.imshow(np.array(image.resize((224, 224))))
                 ax.axis('off')
                 ax.set_title("Original Image", fontsize=14, fontweight='bold')
                 st.pyplot(fig)
                 plt.close()
             
             with col4:
-                st.subheader("Attention Heatmap")
+                st.subheader("Attention Map")
                 fig, ax = plt.subplots(figsize=(6, 6))
-                ax.imshow(st.session_state.cam_image)
+                
+                # Overlay attention map on original image
+                original_resized = np.array(image.resize((224, 224)))
+                im = ax.imshow(original_resized, alpha=0.6)
+                heatmap = ax.imshow(st.session_state.attention_map, alpha=0.4, cmap='jet')
+                
                 ax.axis('off')
-                ax.set_title("EigenCAM Visualization", fontsize=14, fontweight='bold')
+                ax.set_title("Attention Heatmap", fontsize=14, fontweight='bold')
+                plt.colorbar(heatmap, ax=ax, shrink=0.8)
                 st.pyplot(fig)
                 plt.close()
             
@@ -434,7 +435,7 @@ def main():
                 **⚠️ Pneumonia Detected**
                 
                 The AI model has identified patterns consistent with pneumonia in this chest X-ray. 
-                The highlighted areas in the heatmap show where the model detected concerning features.
+                The attention map shows areas the model focused on when making this prediction.
                 
                 **Important**: This is an AI prediction and should be verified by a qualified radiologist.
                 """)
@@ -491,10 +492,10 @@ def main():
         - **Pneumonia Recall**: 95%
         
         ### Production Features
-        - **Automatic Model Download**: Downloads models from Google Drive on first run
+        - **Automatic Model Download**: Downloads model from Google Drive on first run
         - **Model Caching**: Uses Streamlit caching for faster subsequent loads
         - **Error Handling**: Comprehensive error handling for production stability
-        - **Memory Management**: Proper cleanup of matplotlib figures
+        - **Simple Attention Map**: Custom attention visualization without external dependencies
         """)
     
     # Footer
@@ -504,7 +505,7 @@ def main():
         <p><strong>Chest X-Ray Pneumonia Detection using Swin Transformer</strong></p>
         <p>This project demonstrates the application of state-of-the-art computer vision techniques in medical image analysis.</p>
         <p><em>⚠️ For educational purposes only. Not intended for clinical use.</em></p>
-        <p><small>🔗 Models are automatically downloaded from Google Drive on first run</small></p>
+        <p><small>🔗 Model is automatically downloaded from Google Drive on first run</small></p>
     </div>
     """, unsafe_allow_html=True)
 
