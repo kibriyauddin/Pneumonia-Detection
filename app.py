@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import requests
 import os
 from pathlib import Path
+import gdown
 
 # Page configuration
 st.set_page_config(
@@ -68,29 +69,50 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def download_file_from_google_drive(file_id, destination):
-    """Download file from Google Drive using file ID"""
-    URL = "https://drive.google.com/uc?export=download"
-    
-    session = requests.Session()
-    response = session.get(URL, params={'id': file_id}, stream=True)
-    
-    # Handle large files that require confirmation
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            params = {'id': file_id, 'confirm': value}
-            response = session.get(URL, params=params, stream=True)
-            break
-    
-    # Save the file
-    total_size = 0
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(chunk_size=32768):
-            if chunk:
-                f.write(chunk)
-                total_size += len(chunk)
-    
-    return total_size
+def download_file_from_google_drive_gdown(file_id, destination):
+    """Download file from Google Drive using gdown library"""
+    try:
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, str(destination), quiet=False)
+        return True
+    except Exception as e:
+        st.error(f"Error with gdown: {str(e)}")
+        return False
+
+def download_file_from_google_drive_requests(file_id, destination):
+    """Download file from Google Drive using requests (fallback method)"""
+    try:
+        # Try direct download URL first
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        session = requests.Session()
+        response = session.get(url, stream=True)
+        
+        # Check if we got a confirmation page (for large files)
+        if "virus scan" in response.text.lower() or "download_warning" in response.text:
+            # Find the confirmation token
+            for line in response.text.split('\n'):
+                if 'confirm=' in line and 'download' in line:
+                    import re
+                    token = re.search(r'confirm=([a-zA-Z0-9\-_]+)', line)
+                    if token:
+                        confirm_url = f"https://drive.google.com/uc?export=download&confirm={token.group(1)}&id={file_id}"
+                        response = session.get(confirm_url, stream=True)
+                        break
+        
+        # Download the file
+        total_size = 0
+        with open(destination, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=32768):
+                if chunk:
+                    f.write(chunk)
+                    total_size += len(chunk)
+        
+        return total_size > 1000000  # Return True if file is larger than 1MB
+        
+    except Exception as e:
+        st.error(f"Error with requests method: {str(e)}")
+        return False
 
 def download_models():
     """Download model files from Google Drive if they don't exist"""
@@ -99,7 +121,8 @@ def download_models():
     models_config = {
         "swin_transformer_weights.pth": {
             "file_id": "1Tzlr3zIf1iNzBCLHlkYVel7EKtq_tUZF",
-            "size_mb": "~400MB"
+            "size_mb": "~400MB",
+            "direct_url": "https://drive.google.com/file/d/1Tzlr3zIf1iNzBCLHlkYVel7EKtq_tUZF/view?usp=sharing"
         }
     }
     
@@ -113,22 +136,44 @@ def download_models():
         
         if not model_path.exists():
             st.info(f"📥 Downloading {model_name} ({config['size_mb']})...")
+            st.info(f"🔗 **Direct Download Link**: {config['direct_url']}")
+            
             progress_bar = st.progress(0)
             status_text = st.empty()
             
             try:
-                status_text.text("Connecting to Google Drive...")
+                status_text.text("Attempting download method 1 (gdown)...")
                 progress_bar.progress(25)
                 
-                status_text.text("Downloading model file...")
-                progress_bar.progress(50)
+                # Try gdown first (more reliable for large files)
+                success = download_file_from_google_drive_gdown(config["file_id"], model_path)
                 
-                file_size = download_file_from_google_drive(config["file_id"], model_path)
+                if not success or not model_path.exists() or model_path.stat().st_size < 1000000:
+                    status_text.text("Attempting download method 2 (requests)...")
+                    progress_bar.progress(50)
+                    
+                    # Try requests method as fallback
+                    success = download_file_from_google_drive_requests(config["file_id"], model_path)
                 
-                progress_bar.progress(100)
-                status_text.text(f"✅ Download completed! ({file_size / (1024*1024):.1f} MB)")
-                
-                download_status[model_name] = "✅ Downloaded successfully"
+                if model_path.exists() and model_path.stat().st_size > 1000000:
+                    file_size = model_path.stat().st_size
+                    progress_bar.progress(100)
+                    status_text.text(f"✅ Download completed! ({file_size / (1024*1024):.1f} MB)")
+                    download_status[model_name] = "✅ Downloaded successfully"
+                else:
+                    progress_bar.progress(0)
+                    status_text.text("❌ Download failed - please try manual download")
+                    download_status[model_name] = "❌ Download failed - try manual download"
+                    
+                    # Show manual download instructions
+                    st.error(f"""
+                    **Manual Download Required**
+                    
+                    The automatic download failed. Please:
+                    1. Click this link: {config['direct_url']}
+                    2. Download the file manually
+                    3. Upload it using the file uploader below
+                    """)
                 
             except Exception as e:
                 download_status[model_name] = f"❌ Download failed: {str(e)}"
@@ -150,6 +195,12 @@ def load_model():
         
         if not weights_path.exists():
             st.error("❌ Model weights file not found. Please download it first.")
+            return None, None
+        
+        # Check file size
+        file_size = weights_path.stat().st_size
+        if file_size < 1000000:  # Less than 1MB
+            st.error(f"❌ Model file seems corrupted (only {file_size} bytes). Please re-download.")
             return None, None
         
         # Create model architecture
@@ -306,21 +357,46 @@ def main():
     if not weights_path.exists():
         st.warning("⚠️ Model file not found. Please download it first.")
         
-        if st.button("📥 Download Model from Google Drive", type="primary"):
-            with st.spinner("Downloading model... This may take a few minutes..."):
-                download_status = download_models()
+        # Show download options
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📥 Download Model from Google Drive", type="primary"):
+                with st.spinner("Downloading model... This may take a few minutes..."):
+                    download_status = download_models()
+                    
+                    # Display download status
+                    st.subheader("📊 Download Status")
+                    for model_name, status in download_status.items():
+                        if "✅" in status:
+                            st.success(f"{model_name}: {status}")
+                        else:
+                            st.error(f"{model_name}: {status}")
+                    
+                    if any("✅" in status for status in download_status.values()):
+                        st.success("🔄 Reloading app with downloaded model...")
+                        st.rerun()
+        
+        with col2:
+            st.subheader("📤 Manual Upload")
+            uploaded_model = st.file_uploader(
+                "Upload model file manually", 
+                type=['pth'],
+                help="If automatic download fails, upload the .pth file here"
+            )
+            
+            if uploaded_model is not None:
+                # Save uploaded model
+                models_dir = Path("models")
+                models_dir.mkdir(exist_ok=True)
                 
-                # Display download status
-                st.subheader("📊 Download Status")
-                for model_name, status in download_status.items():
-                    if "✅" in status:
-                        st.success(f"{model_name}: {status}")
-                    else:
-                        st.error(f"{model_name}: {status}")
+                model_path = models_dir / "swin_transformer_weights.pth"
+                with open(model_path, "wb") as f:
+                    f.write(uploaded_model.read())
                 
-                if any("✅" in status for status in download_status.values()):
-                    st.success("🔄 Reloading app with downloaded model...")
-                    st.rerun()
+                st.success(f"✅ Model uploaded successfully! ({model_path.stat().st_size / (1024*1024):.1f} MB)")
+                st.rerun()
+    
     else:
         st.success("✅ Model file is available!")
         size_mb = weights_path.stat().st_size / (1024 * 1024)
@@ -492,8 +568,9 @@ def main():
         - **Pneumonia Recall**: 95%
         
         ### Production Features
-        - **Automatic Model Download**: Downloads model from Google Drive on first run
-        - **Model Caching**: Uses Streamlit caching for faster subsequent loads
+        - **Multiple Download Methods**: Automatic download with fallback options
+        - **Manual Upload**: Upload model file directly if download fails
+        - **Model Validation**: Checks file size and integrity
         - **Error Handling**: Comprehensive error handling for production stability
         - **Simple Attention Map**: Custom attention visualization without external dependencies
         """)
@@ -505,7 +582,7 @@ def main():
         <p><strong>Chest X-Ray Pneumonia Detection using Swin Transformer</strong></p>
         <p>This project demonstrates the application of state-of-the-art computer vision techniques in medical image analysis.</p>
         <p><em>⚠️ For educational purposes only. Not intended for clinical use.</em></p>
-        <p><small>🔗 Model is automatically downloaded from Google Drive on first run</small></p>
+        <p><small>🔗 Model can be downloaded automatically or uploaded manually</small></p>
     </div>
     """, unsafe_allow_html=True)
 
